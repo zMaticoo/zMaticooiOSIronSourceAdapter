@@ -11,7 +11,7 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface ISMaticooCustomAdapter : ISBaseNetworkAdapter
+@interface ISMaticooCustomAdapter : ISBaseNetworkAdapter <ISAdapterMetaDataProtocol, ISAdapterConsentProtocol>
 - (void)init:(ISAdData *)adData delegate:(id<ISNetworkInitializationDelegate>)delegate;
 - (NSString *) networkSDKVersion;
 - (NSString *) adapterVersion;

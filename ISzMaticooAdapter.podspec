@@ -8,7 +8,7 @@
 
 Pod::Spec.new do |s|
   s.name             = 'ISzMaticooAdapter'
-  s.version          = '1.1.4'
+  s.version          = '2.2.0'
   s.summary          = 'A short description of ISzMaticooAdapter.'
 
 # This description is used to generate tags and improve search results.
@@ -28,7 +28,7 @@ This is zMaticoo iOS SDK IronSource Adaper.
   s.source           = { :git => 'https://github.com/zMaticoo/zMaticooiOSIronSourceAdapter.git', :tag => s.version.to_s }
   # s.social_media_url = 'https://twitter.com/<TWITTER_USERNAME>'
 
-  s.ios.deployment_target = '11.0'
+  s.ios.deployment_target = '12.0'
 
   s.source_files = 'ISzMaticooAdapter/Classes/**/*'
   
