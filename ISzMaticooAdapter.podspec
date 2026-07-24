@@ -8,7 +8,7 @@
 
 Pod::Spec.new do |s|
   s.name             = 'ISzMaticooAdapter'
-  s.version          = '2.2.0'
+  s.version          = '2.2.0.1'
   s.summary          = 'A short description of ISzMaticooAdapter.'
 
 # This description is used to generate tags and improve search results.
