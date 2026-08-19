@@ -6,6 +6,7 @@
 //
 
 #import "ISMaticooCustomRewardedVideo.h"
+#import "ISMaticooAdUtils.h"
 #import "MaticooIronSourceAdapterDebugLog.h"
 #import <MaticooSDK/MATRewardedVideoAd.h>
 #import <MaticooSDK/MaticooAds.h>
@@ -254,6 +255,36 @@ static NSString *MATRewardedAdTypeDes(NSString * _Nullable placementId, NSString
 
 @implementation ISMaticooCustomRewardedVideo
 
+// IronSource 在自己的线程调 isAdAvailableWithAdData: / showAdWithViewController:，而这两个属性是在主线程写的。
+// ARC 并发读写 strong 属性会读到哨兵指针 0x400000000000bad0，读写必须同锁。
+// 注意：持锁顺序统一为 self → bridge，用到 bridge 时先取局部变量，不要在 @synchronized(bridge) 内再走 self 的 getter。
+@synthesize rewardedVideo = _rewardedVideo;
+@synthesize bridge = _bridge;
+
+- (MATRewardedVideoAd *)rewardedVideo {
+    @synchronized (self) {
+        return _rewardedVideo;
+    }
+}
+
+- (void)setRewardedVideo:(MATRewardedVideoAd *)rewardedVideo {
+    @synchronized (self) {
+        _rewardedVideo = rewardedVideo;
+    }
+}
+
+- (ISMaticooRewardedBridge *)bridge {
+    @synchronized (self) {
+        return _bridge;
+    }
+}
+
+- (void)setBridge:(ISMaticooRewardedBridge *)bridge {
+    @synchronized (self) {
+        _bridge = bridge;
+    }
+}
+
 #pragma mark - Rewarded Methods
 
 - (void)loadAdWithAdData:(nonnull ISAdData *)adData
@@ -273,10 +304,12 @@ static NSString *MATRewardedAdTypeDes(NSString * _Nullable placementId, NSString
             return;
         }
 
+        ISMaticooRewardedBridge *bridge = [ISMaticooRewardedBridge bridgeForPlacementId:placementId];
+        MATRewardedVideoAd *rewardedVideo = [[MATRewardedVideoAd alloc] initWithPlacementID:placementId];
         self.placementId = placementId;
-        self.bridge = [ISMaticooRewardedBridge bridgeForPlacementId:placementId];
-        self.rewardedVideo = [[MATRewardedVideoAd alloc] initWithPlacementID:placementId];
-        if (!self.rewardedVideo || !self.bridge) {
+        self.bridge = bridge;
+        self.rewardedVideo = rewardedVideo;
+        if (!rewardedVideo || !bridge) {
             [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_load_failed"
                                                                des:MATRewardedAdTypeDes(placementId, @"ad or bridge is nil")];
             if ([delegate respondsToSelector:@selector(adDidFailToLoadWithErrorType:errorCode:errorMessage:)]) {
@@ -288,12 +321,12 @@ static NSString *MATRewardedAdTypeDes(NSString * _Nullable placementId, NSString
         }
 
         MaticooIronSourceAdapterDebugLog(@"loadAdWithAdData self=%@ ad=%@ bridge=%@ isReady=%d isShowing=%d",
-                                         self, self.rewardedVideo, self.bridge,
-                                         self.rewardedVideo.isReady, [self.bridge isShowingSafe]);
+                                         self, rewardedVideo, bridge,
+                                         rewardedVideo.isReady, [bridge isShowingSafe]);
 
         // zMaticoo 不支持同一 pid 在 show 时去 load
-        if ([self.bridge isShowingSafe]) {
-            MaticooIronSourceAdapterDebugLog(@"load skipped(showing) self=%@ bridge=%@ smash=%@", self, self.bridge, delegate);
+        if ([bridge isShowingSafe]) {
+            MaticooIronSourceAdapterDebugLog(@"load skipped(showing) self=%@ bridge=%@ smash=%@", self, bridge, delegate);
             [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_load_failed"
                                                                des:MATRewardedAdTypeDes(placementId, @"placement is showing")];
             if ([delegate respondsToSelector:@selector(adDidFailToLoadWithErrorType:errorCode:errorMessage:)]) {
@@ -304,24 +337,30 @@ static NSString *MATRewardedAdTypeDes(NSString * _Nullable placementId, NSString
             return;
         }
 
-        if (self.rewardedVideo.isReady) {
-            @synchronized (self.bridge) {
-                self.bridge.didCallBackLoadResult = YES;
-                self.bridge.loadSmashDelegate = nil;
+        if (rewardedVideo.isReady) {
+            @synchronized (bridge) {
+                bridge.didCallBackLoadResult = YES;
+                bridge.loadSmashDelegate = nil;
             }
-            MaticooIronSourceAdapterDebugLog(@"loadAdWithAdData ready hit self=%@ ad=%@ smash=%@", self, self.rewardedVideo, delegate);
+            MaticooIronSourceAdapterDebugLog(@"loadAdWithAdData ready hit self=%@ ad=%@ smash=%@", self, rewardedVideo, delegate);
             if ([delegate respondsToSelector:@selector(adDidLoad)]) {
                 [delegate adDidLoad];
             }
             return;
         }
 
-        [self.bridge prepareForLoadWithSmashDelegate:delegate];
-        self.rewardedVideo.delegate = self.bridge;
+        [bridge prepareForLoadWithSmashDelegate:delegate];
+        rewardedVideo.delegate = bridge;
+
+        NSDictionary *extraMap = ISMaticooLoadExtraMapFromAdData(adData);
+        NSNumber *isMuted = extraMap[@"is_muted"];
+        if ([isMuted isKindOfClass:[NSNumber class]]) {
+            rewardedVideo.videoMute = isMuted.boolValue;
+        }
 
         [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_load"
                                                            des:MATRewardedAdTypeDes(placementId, nil)];
-        [self.rewardedVideo loadAd];
+        [rewardedVideo loadAdExtraMap:extraMap];
     });
 }
 
@@ -333,22 +372,25 @@ static NSString *MATRewardedAdTypeDes(NSString * _Nullable placementId, NSString
 - (void)showAdWithViewController:(nonnull UIViewController *)viewController
                           adData:(nonnull ISAdData *)adData
                         delegate:(nonnull id<ISRewardedVideoAdDelegate>)delegate {
-    MaticooIronSourceAdapterDebugLog(@"showAdWithViewController self=%@ ad=%@ bridge=%@ smashDelegate=%@",
-                                     self, self.rewardedVideo, self.bridge, delegate);
-
+    // 广告对象与 bridge 的读取一律放到主线程 hop 之后，避免在 IronSource 线程上跨线程读 strong 属性。
     dispatch_main_MATASYNC_safe(^{
-        if (!self.bridge) {
+        ISMaticooRewardedBridge *bridge = self.bridge;
+        if (!bridge) {
             NSString *placementId = self.placementId;
             if (placementId.length == 0) {
                 id placementIdValue = [adData getString:@"placement_id"];
                 placementId = [placementIdValue isKindOfClass:[NSString class]] ? (NSString *)placementIdValue : nil;
             }
             if (placementId.length > 0) {
-                self.bridge = [ISMaticooRewardedBridge bridgeForPlacementId:placementId];
+                bridge = [ISMaticooRewardedBridge bridgeForPlacementId:placementId];
+                self.bridge = bridge;
                 self.placementId = placementId;
             }
         }
-        if (!self.bridge || !self.rewardedVideo) {
+        MATRewardedVideoAd *rewardedVideo = self.rewardedVideo;
+        MaticooIronSourceAdapterDebugLog(@"showAdWithViewController self=%@ ad=%@ bridge=%@ smashDelegate=%@",
+                                         self, rewardedVideo, bridge, delegate);
+        if (!bridge || !rewardedVideo) {
             [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_show_failed"
                                                                des:MATRewardedAdTypeDes(self.placementId, @"bridge or ad is nil")];
             if ([delegate respondsToSelector:@selector(adDidFailToShowWithErrorCode:errorMessage:)]) {
@@ -358,7 +400,7 @@ static NSString *MATRewardedAdTypeDes(NSString * _Nullable placementId, NSString
             return;
         }
 
-        if (![self.rewardedVideo isReady]) {
+        if (![rewardedVideo isReady]) {
             [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_show_failed"
                                                                des:MATRewardedAdTypeDes(self.placementId, @"rewardedVideo is not ready")];
             if ([delegate respondsToSelector:@selector(adDidFailToShowWithErrorCode:errorMessage:)]) {
@@ -368,25 +410,31 @@ static NSString *MATRewardedAdTypeDes(NSString * _Nullable placementId, NSString
             return;
         }
 
-        [self.bridge prepareForShowWithSmashDelegate:delegate];
-        @synchronized (self.bridge) {
-            self.bridge.isShowing = YES;
+        [bridge prepareForShowWithSmashDelegate:delegate];
+        @synchronized (bridge) {
+            bridge.isShowing = YES;
         }
-        self.rewardedVideo.delegate = self.bridge;
+        rewardedVideo.delegate = bridge;
 
         [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_show"
                                                            des:MATRewardedAdTypeDes(self.placementId, nil)];
-        [self.rewardedVideo showAdFromViewController:viewController];
+        [rewardedVideo showAdFromViewController:viewController];
     });
 }
 
 - (void)dealloc {
+    MATRewardedVideoAd *ad = nil;
+    @synchronized (self) {
+        ad = _rewardedVideo;
+        _rewardedVideo = nil;
+    }
     MaticooIronSourceAdapterDebugLog(@"Adapter dealloc self=%@ ad=%@ bridge=%@ placementId=%@ isShowing=%d",
-                                     self, _rewardedVideo, _bridge, _placementId, [_bridge isShowingSafe]);
+                                     self, ad, _bridge, _placementId, [_bridge isShowingSafe]);
     if (_placementId.length > 0) {
         [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_destroy"
                                                            des:MATRewardedAdTypeDes(_placementId, nil)];
     }
+    ad.delegate = nil;
 }
 
 @end

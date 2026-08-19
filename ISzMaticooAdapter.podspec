@@ -8,7 +8,7 @@
 
 Pod::Spec.new do |s|
   s.name             = 'ISzMaticooAdapter'
-  s.version          = '2.2.0.1'
+  s.version          = '2.3.0'
   s.summary          = 'A short description of ISzMaticooAdapter.'
 
 # This description is used to generate tags and improve search results.
@@ -49,7 +49,7 @@ This is zMaticoo iOS SDK IronSource Adaper.
 
   #spec.license      = "MIT (example)"
    s.dependency 'IronSourceSDK'
-   s.dependency 'zMaticoo'
+   s.dependency 'zMaticoo', '>= 2.3.0'
    s.static_framework = true
 
 # ――― Source Code ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――― #

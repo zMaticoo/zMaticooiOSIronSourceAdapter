@@ -7,6 +7,7 @@
 //
 
 #import "ISMaticooCustomInterstitial.h"
+#import "ISMaticooAdUtils.h"
 #import "MaticooIronSourceAdapterDebugLog.h"
 #import <MaticooSDK/MATInterstitialAd.h>
 #import <MaticooSDK/MaticooAds.h>
@@ -218,6 +219,36 @@ static NSString *MATInterstitialAdTypeDes(NSString * _Nullable placementId, NSSt
 
 @implementation ISMaticooCustomInterstitial
 
+// IronSource 在自己的线程调 isAdAvailableWithAdData: / showAdWithViewController:，而这两个属性是在主线程写的。
+// ARC 并发读写 strong 属性会读到哨兵指针 0x400000000000bad0，读写必须同锁。
+// 注意：持锁顺序统一为 self → bridge，用到 bridge 时先取局部变量，不要在 @synchronized(bridge) 内再走 self 的 getter。
+@synthesize interstitial = _interstitial;
+@synthesize bridge = _bridge;
+
+- (MATInterstitialAd *)interstitial {
+    @synchronized (self) {
+        return _interstitial;
+    }
+}
+
+- (void)setInterstitial:(MATInterstitialAd *)interstitial {
+    @synchronized (self) {
+        _interstitial = interstitial;
+    }
+}
+
+- (ISMaticooInterstitialBridge *)bridge {
+    @synchronized (self) {
+        return _bridge;
+    }
+}
+
+- (void)setBridge:(ISMaticooInterstitialBridge *)bridge {
+    @synchronized (self) {
+        _bridge = bridge;
+    }
+}
+
 #pragma mark - Interstitial Methods
 
 - (void)loadAdWithAdData:(nonnull ISAdData *)adData
@@ -237,10 +268,12 @@ static NSString *MATInterstitialAdTypeDes(NSString * _Nullable placementId, NSSt
             return;
         }
 
+        ISMaticooInterstitialBridge *bridge = [ISMaticooInterstitialBridge bridgeForPlacementId:placementId];
+        MATInterstitialAd *interstitial = [[MATInterstitialAd alloc] initWithPlacementID:placementId];
         self.placementId = placementId;
-        self.bridge = [ISMaticooInterstitialBridge bridgeForPlacementId:placementId];
-        self.interstitial = [[MATInterstitialAd alloc] initWithPlacementID:placementId];
-        if (!self.interstitial || !self.bridge) {
+        self.bridge = bridge;
+        self.interstitial = interstitial;
+        if (!interstitial || !bridge) {
             [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_load_failed"
                                                                des:MATInterstitialAdTypeDes(placementId, @"ad or bridge is nil")];
             if ([delegate respondsToSelector:@selector(adDidFailToLoadWithErrorType:errorCode:errorMessage:)]) {
@@ -252,12 +285,12 @@ static NSString *MATInterstitialAdTypeDes(NSString * _Nullable placementId, NSSt
         }
 
         MaticooIronSourceAdapterDebugLog(@"loadAdWithAdData self=%@ ad=%@ bridge=%@ isReady=%d isShowing=%d",
-                                         self, self.interstitial, self.bridge,
-                                         self.interstitial.isReady, [self.bridge isShowingSafe]);
+                                         self, interstitial, bridge,
+                                         interstitial.isReady, [bridge isShowingSafe]);
 
         // zMaticoo 不支持同一 pid 在 show 时去 load
-        if ([self.bridge isShowingSafe]) {
-            MaticooIronSourceAdapterDebugLog(@"load skipped(showing) self=%@ bridge=%@ smash=%@", self, self.bridge, delegate);
+        if ([bridge isShowingSafe]) {
+            MaticooIronSourceAdapterDebugLog(@"load skipped(showing) self=%@ bridge=%@ smash=%@", self, bridge, delegate);
             [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_load_failed"
                                                                des:MATInterstitialAdTypeDes(placementId, @"placement is showing")];
             if ([delegate respondsToSelector:@selector(adDidFailToLoadWithErrorType:errorCode:errorMessage:)]) {
@@ -268,24 +301,30 @@ static NSString *MATInterstitialAdTypeDes(NSString * _Nullable placementId, NSSt
             return;
         }
 
-        if (self.interstitial.isReady) {
-            @synchronized (self.bridge) {
-                self.bridge.didCallBackLoadResult = YES;
-                self.bridge.loadSmashDelegate = nil;
+        if (interstitial.isReady) {
+            @synchronized (bridge) {
+                bridge.didCallBackLoadResult = YES;
+                bridge.loadSmashDelegate = nil;
             }
-            MaticooIronSourceAdapterDebugLog(@"loadAdWithAdData ready hit self=%@ ad=%@ smash=%@", self, self.interstitial, delegate);
+            MaticooIronSourceAdapterDebugLog(@"loadAdWithAdData ready hit self=%@ ad=%@ smash=%@", self, interstitial, delegate);
             if ([delegate respondsToSelector:@selector(adDidLoad)]) {
                 [delegate adDidLoad];
             }
             return;
         }
 
-        [self.bridge prepareForLoadWithSmashDelegate:delegate];
-        self.interstitial.delegate = self.bridge;
+        [bridge prepareForLoadWithSmashDelegate:delegate];
+        interstitial.delegate = bridge;
+
+        NSDictionary *extraMap = ISMaticooLoadExtraMapFromAdData(adData);
+        NSNumber *isMuted = extraMap[@"is_muted"];
+        if ([isMuted isKindOfClass:[NSNumber class]]) {
+            interstitial.videoMute = isMuted.boolValue;
+        }
 
         [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_load"
                                                            des:MATInterstitialAdTypeDes(placementId, nil)];
-        [self.interstitial loadAd];
+        [interstitial loadAdExtraMap:extraMap];
     });
 }
 
@@ -297,22 +336,25 @@ static NSString *MATInterstitialAdTypeDes(NSString * _Nullable placementId, NSSt
 - (void)showAdWithViewController:(nonnull UIViewController *)viewController
                           adData:(nonnull ISAdData *)adData
                         delegate:(nonnull id<ISInterstitialAdDelegate>)delegate {
-    MaticooIronSourceAdapterDebugLog(@"showAdWithViewController self=%@ ad=%@ bridge=%@ smashDelegate=%@",
-                                     self, self.interstitial, self.bridge, delegate);
-
+    // 广告对象与 bridge 的读取一律放到主线程 hop 之后，避免在 IronSource 线程上跨线程读 strong 属性。
     dispatch_main_MATASYNC_safe(^{
-        if (!self.bridge) {
+        ISMaticooInterstitialBridge *bridge = self.bridge;
+        if (!bridge) {
             NSString *placementId = self.placementId;
             if (placementId.length == 0) {
                 id placementIdValue = [adData getString:@"placement_id"];
                 placementId = [placementIdValue isKindOfClass:[NSString class]] ? (NSString *)placementIdValue : nil;
             }
             if (placementId.length > 0) {
-                self.bridge = [ISMaticooInterstitialBridge bridgeForPlacementId:placementId];
+                bridge = [ISMaticooInterstitialBridge bridgeForPlacementId:placementId];
+                self.bridge = bridge;
                 self.placementId = placementId;
             }
         }
-        if (!self.bridge || !self.interstitial) {
+        MATInterstitialAd *interstitial = self.interstitial;
+        MaticooIronSourceAdapterDebugLog(@"showAdWithViewController self=%@ ad=%@ bridge=%@ smashDelegate=%@",
+                                         self, interstitial, bridge, delegate);
+        if (!bridge || !interstitial) {
             [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_show_failed"
                                                                des:MATInterstitialAdTypeDes(self.placementId, @"bridge or ad is nil")];
             if ([delegate respondsToSelector:@selector(adDidFailToShowWithErrorCode:errorMessage:)]) {
@@ -322,7 +364,7 @@ static NSString *MATInterstitialAdTypeDes(NSString * _Nullable placementId, NSSt
             return;
         }
 
-        if (![self.interstitial isReady]) {
+        if (![interstitial isReady]) {
             [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_show_failed"
                                                                des:MATInterstitialAdTypeDes(self.placementId, @"interstitial is not ready")];
             if ([delegate respondsToSelector:@selector(adDidFailToShowWithErrorCode:errorMessage:)]) {
@@ -332,25 +374,31 @@ static NSString *MATInterstitialAdTypeDes(NSString * _Nullable placementId, NSSt
             return;
         }
 
-        [self.bridge prepareForShowWithSmashDelegate:delegate];
-        @synchronized (self.bridge) {
-            self.bridge.isShowing = YES;
+        [bridge prepareForShowWithSmashDelegate:delegate];
+        @synchronized (bridge) {
+            bridge.isShowing = YES;
         }
-        self.interstitial.delegate = self.bridge;
+        interstitial.delegate = bridge;
 
         [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_show"
                                                            des:MATInterstitialAdTypeDes(self.placementId, nil)];
-        [self.interstitial showAdFromViewController:viewController];
+        [interstitial showAdFromViewController:viewController];
     });
 }
 
 - (void)dealloc {
+    MATInterstitialAd *ad = nil;
+    @synchronized (self) {
+        ad = _interstitial;
+        _interstitial = nil;
+    }
     MaticooIronSourceAdapterDebugLog(@"Adapter dealloc self=%@ ad=%@ bridge=%@ placementId=%@ isShowing=%d",
-                                     self, _interstitial, _bridge, _placementId, [_bridge isShowingSafe]);
+                                     self, ad, _bridge, _placementId, [_bridge isShowingSafe]);
     if (_placementId.length > 0) {
         [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_destroy"
                                                            des:MATInterstitialAdTypeDes(_placementId, nil)];
     }
+    ad.delegate = nil;
 }
 
 @end

@@ -7,12 +7,42 @@
 //
 
 #import "ISMaticooCustomAdapter.h"
+#import "ISMaticooAdUtils.h"
 #import <MaticooSDK/MaticooAds.h>
+
+NSNumber *ISMaticooMutedFromAdData(ISAdData *adData) {
+    if (!adData) {
+        return nil;
+    }
+    NSString *value = [adData getString:@"is_muted"];
+    if (![value isKindOfClass:[NSString class]]) {
+        return nil;
+    }
+    value = [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([value caseInsensitiveCompare:@"true"] == NSOrderedSame) {
+        return @YES;
+    }
+    if ([value caseInsensitiveCompare:@"false"] == NSOrderedSame) {
+        return @NO;
+    }
+    return nil;
+}
+
+NSDictionary<NSString *, id> *ISMaticooLoadExtraMapFromAdData(ISAdData *adData) {
+    NSMutableDictionary *map = [NSMutableDictionary dictionary];
+    map[@"source"] = @"ironsource";
+    NSNumber *isMuted = ISMaticooMutedFromAdData(adData);
+    if (isMuted != nil) {
+        map[@"is_muted"] = isMuted;
+    }
+    return [map copy];
+}
 
 @implementation ISMaticooCustomAdapter
 
 - (void)init:(ISAdData *)adData delegate:(id<ISNetworkInitializationDelegate>)delegate {
-    NSString *appKey = [adData getString:@"app_key"];
+    id appKeyValue = [adData getString:@"app_key"];
+    NSString *appKey = [appKeyValue isKindOfClass:[NSString class]] ? (NSString *)appKeyValue : nil;
     if (appKey.length == 0) {
         if ([delegate respondsToSelector:@selector(onInitDidFailWithErrorCode:errorMessage:)]) {
             [delegate onInitDidFailWithErrorCode:ISAdapterErrorMissingParams errorMessage:@"zMaticoo Adapter Error: app key is empty"];

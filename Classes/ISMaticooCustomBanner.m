@@ -13,7 +13,7 @@
 /// 与 Android `AdUtils.getAdTypeDes(1, ...)` 一致：adType=1 为 Banner；`source` 与 `Constant.KEY_AD_MEDIATION` 一致。
 static NSString * const kAdapterSource = @"ironsource";
 static const NSInteger kAdTypeBanner = 1;
-/// 与 `ZMATLoadFailedNoFill`（20105）对齐，用于 IronSource `ISAdapterErrorTypeNoFill`。
+/// Maticoo 无填充错误码，用于映射到 IronSource `ISAdapterErrorTypeNoFill`。
 static const NSInteger kMATLoadFailedNoFillCode = 20105;
 
 #define dispatch_main_MATASYNC_safe(block)\
@@ -44,6 +44,23 @@ static NSString *MATBannerAdTypeDes(NSString * _Nullable placementId, NSString *
 
 @implementation ISMaticooCustomBanner
 
+// load / destroy 虽 hop 到主线程，IronSource 不保证在主线程释放 adapter。
+// ARC 并发读写 nonatomic strong 会读到哨兵指针 0x400000000000bad0，读写必须同锁。
+// 持锁只保护指针交换；拿到局部变量后再调 SDK。
+@synthesize banner = _banner;
+
+- (MATBannerAd *)banner {
+    @synchronized (self) {
+        return _banner;
+    }
+}
+
+- (void)setBanner:(MATBannerAd *)banner {
+    @synchronized (self) {
+        _banner = banner;
+    }
+}
+
 - (void)loadAdWithAdData:(nonnull ISAdData *)adData
           viewController:(UIViewController *)viewController
                     size:(ISBannerSize *)size
@@ -57,7 +74,8 @@ static NSString *MATBannerAdTypeDes(NSString * _Nullable placementId, NSString *
             return;
         }
 
-        NSString *placementId = [adData getString:@"placement_id"];
+        id placementIdValue = [adData getString:@"placement_id"];
+        NSString *placementId = [placementIdValue isKindOfClass:[NSString class]] ? (NSString *)placementIdValue : nil;
         if (placementId.length == 0) {
             [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_load_failed" des:MATBannerAdTypeDes(nil, @"placement_id is nil")];
             if ([delegate respondsToSelector:@selector(adDidFailToLoadWithErrorType:errorCode:errorMessage:)]) {
@@ -72,22 +90,27 @@ static NSString *MATBannerAdTypeDes(NSString * _Nullable placementId, NSString *
 
         [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_load" des:MATBannerAdTypeDes(placementId, nil)];
 
-        self.banner = [[MATBannerAd alloc] initWithPlacementID:placementId];
-        self.banner.delegate = self;
-        self.banner.localExtra = @{ @"source" : kAdapterSource };
+        MATBannerAd *banner = [[MATBannerAd alloc] initWithPlacementID:placementId];
+        banner.delegate = self;
+        banner.localExtra = @{ @"source" : kAdapterSource };
         if ([adData getBoolean:@"can_close_ad"]) {
-            self.banner.canCloseAd = YES;
+            banner.canCloseAd = YES;
         }
-        [self.banner loadAd];
+        self.banner = banner;
+        [banner loadAd];
     });
 }
 
 - (void)destroyAdWithAdData:(nonnull ISAdData *)adData {
     dispatch_main_MATASYNC_safe(^{
-        if (self.banner) {
-            self.banner.delegate = nil;
-            [self.banner destroy];
-            self.banner = nil;
+        MATBannerAd *ad = nil;
+        @synchronized (self) {
+            ad = _banner;
+            _banner = nil;
+        }
+        if (ad) {
+            ad.delegate = nil;
+            [ad destroy];
         }
         self.iSDelegate = nil;
         [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_destroy" des:MATBannerAdTypeDes(self.placementId, nil)];
@@ -165,9 +188,12 @@ static NSString *MATBannerAdTypeDes(NSString * _Nullable placementId, NSString *
     [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_destroy" des:MATBannerAdTypeDes(_placementId, nil)];
     // IronSource 不保证在主线程释放 adapter；MATBannerAd 是 UIView 子类，destroy 会拆 subview / 改 layer，
     // 子线程触碰会触发 _UIViewWillDestructorAssertion。先把强引用搬出来再异步到主线程 destroy。
-    MATBannerAd *ad = _banner;
-    _banner.delegate = nil;
-    _banner = nil;
+    MATBannerAd *ad = nil;
+    @synchronized (self) {
+        ad = _banner;
+        _banner = nil;
+    }
+    ad.delegate = nil;
     if (ad) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [ad destroy];
