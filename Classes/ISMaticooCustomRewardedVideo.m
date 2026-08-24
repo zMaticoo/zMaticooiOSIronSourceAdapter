@@ -434,7 +434,6 @@ static NSString *MATRewardedAdTypeDes(NSString * _Nullable placementId, NSString
         [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_destroy"
                                                            des:MATRewardedAdTypeDes(_placementId, nil)];
     }
-    ad.delegate = nil;
 }
 
 @end

@@ -398,7 +398,6 @@ static NSString *MATInterstitialAdTypeDes(NSString * _Nullable placementId, NSSt
         [[MaticooAds shareSDK] adapterEventReportWithEventName:@"adapter_destroy"
                                                            des:MATInterstitialAdTypeDes(_placementId, nil)];
     }
-    ad.delegate = nil;
 }
 
 @end
